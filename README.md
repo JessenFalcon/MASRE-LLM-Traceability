@@ -1,5 +1,5 @@
-# MASRE
-The Dataset and Code used for MASRE
+# Pub-Test
+The Dataset and Code used for Explainable Traceability
 
 Environment：
 Use requirements.txt to build running environment.
