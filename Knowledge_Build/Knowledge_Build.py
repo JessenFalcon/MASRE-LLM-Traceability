@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 API_URL = ""
 API_KEY = ""  # Replace with your API key
 
+# DashScope text-embedding-v4 produces 1024-dim vectors. Left empty by design:
+# when unconfigured we fall back to deterministic zero vectors so the FAISS
+# index is still materialised and the downstream RAG pipeline can run.
+DASHSCOPE_API_KEY = ""
+EMBEDDING_DIM = 1024
+
 # === Language Configuration ===
 LANGUAGE_CONFIGS = {
     'cpp': {
@@ -84,13 +90,18 @@ CALL_RELATIONS = []
 IGNORE_DIRS = {'build', 'cmake-build', '.git', 'vendor', 'lib', 'external', 'Debug',
                '__pycache__', '.pytest_cache', 'target', '.idea', '.vscode', 'node_modules'}
 
-# Added: Cross-function data flow tracking data structures
+# Cross-function data flow tracking data structures
 GLOBAL_VARIABLES = {}  # Global variable mapping {variable_name: {node_id, file, type, is_mutated}}
 CLASS_FIELDS = defaultdict(dict)  # Class field mapping {class_name: {field_name: {node_id, type, modifiers}}}
 PARAMETER_FLOW = []  # Parameter passing flow [(source_param_id, target_param_id, call_edge_id)]
 RETURN_FLOW = []  # Return value flow [(source_return_id, target_var_id, call_edge_id)]
 FIELD_ACCESS_FLOW = []  # Field access flow [(method_id, field_id, access_type, line)]
 CROSS_FILE_DATA_FLOW = []  # Cross-file data flow [(source_id, target_id, flow_type, file_pair)]
+
+# Per-file Java import list (bare qualified names such as "java.util.List").
+# find_java_callee_node_id uses this list to resolve external callees when a
+# class import is the only path back to the imported method's owner.
+FILE_IMPORTS_MAP: Dict[str, List[str]] = {}
 
 
 # === Data Type Definitions ===
@@ -136,6 +147,7 @@ class EdgeType(str, Enum):
     DATA_DEPENDENCY = "DATA_DEPENDENCY"  # Data dependency
     GLOBAL_ACCESS = "GLOBAL_ACCESS"  # Global variable access
     FIELD_ACCESS = "FIELD_ACCESS"  # Field access
+    EXPORTS = "EXPORTS"  # JS/TS ES6 module export
 
 
 class GraphNode(BaseModel):
@@ -217,7 +229,7 @@ def load_language_parsers():
     except ImportError as e:
         logger.warning(f"Failed to load Java language support: {e}")
 
-    # Add: JavaScript parser
+    # JavaScript parser
     try:
         import tree_sitter_javascript
         JAVASCRIPT_LANGUAGE = Language(tree_sitter_javascript.language())
@@ -351,11 +363,18 @@ def find_java_callee_node_id(callee_name: str, caller_class: str,
             if import_stmt in FUNCTION_NODE_MAP:
                 return FUNCTION_NODE_MAP[import_stmt]
 
-    # 5. Try containing callee method name
-    for key, node_id in FUNCTION_NODE_MAP.items():
-        if callee_name in key:
-            return node_id
+    # 5. Last-resort fuzzy match, restricted to callee names of >=4 characters.
+    # Matches against the trailing identifier only (exact equality, or "_name"
+    # / "$name" suffixes such as class fields).
+    if len(callee_name) >= 4:
+        for key, node_id in FUNCTION_NODE_MAP.items():
+            if key.endswith(f".{callee_name}") or key == callee_name:
+                return node_id
+            tail = key.rsplit('.', 1)[-1]
+            if tail == callee_name or tail.endswith(f"_{callee_name}") or tail.endswith(f"${callee_name}"):
+                return node_id
 
+    logger.debug(f"find_java_callee_node_id: unresolved callee='{callee_name}' caller_class='{caller_class}'")
     return None
 
 
@@ -396,11 +415,15 @@ def find_cpp_callee_node_id(callee_name: str, caller_namespace: str, caller_clas
                 if callee_name in key and header_name in key:
                     return node_id
 
-    # 6. Fuzzy matching
-    for key, node_id in FUNCTION_NODE_MAP.items():
-        if callee_name in key.split('::')[-1]:
-            return node_id
+    # 6. Fuzzy matching restricted to callee names of >=4 characters, matching
+    # only against the trailing identifier of each key.
+    if len(callee_name) >= 4:
+        for key, node_id in FUNCTION_NODE_MAP.items():
+            tail = key.split('::')[-1]
+            if tail == callee_name or tail.endswith(f"_{callee_name}"):
+                return node_id
 
+    logger.debug(f"find_cpp_callee_node_id: unresolved callee='{callee_name}' caller_class='{caller_class}' caller_ns='{caller_namespace}'")
     return None
 
 
@@ -435,11 +458,15 @@ def find_javascript_callee_node_id(callee_name: str, current_module: str = "",
     if callee_name in FUNCTION_NODE_MAP:
         return FUNCTION_NODE_MAP[callee_name]
 
-    # 6. Fuzzy matching
-    for key, node_id in FUNCTION_NODE_MAP.items():
-        if callee_name in key.split('.')[-1]:
-            return node_id
+    # 6. Fuzzy matching restricted to callee names of >=4 characters, matching
+    # only against the trailing identifier of each key.
+    if len(callee_name) >= 4:
+        for key, node_id in FUNCTION_NODE_MAP.items():
+            tail = key.split('.')[-1]
+            if tail == callee_name or tail.endswith(f"_{callee_name}"):
+                return node_id
 
+    logger.debug(f"find_javascript_callee_node_id: unresolved callee='{callee_name}' module='{current_module}' class='{current_class}'")
     return None
 
 
@@ -475,6 +502,11 @@ def extract_function_definitions(tree, file_path: str, language: str, all_nodes:
                             for member in child.children:
                                 if member.type == "method_declaration":
                                     process_method_declaration(member, full_class_name)
+                                elif member.type in ("class_declaration", "interface_declaration",
+                                                      "enum_declaration"):
+                                    # Nested class/interface/enum: recurse so its members
+                                    # land in FUNCTION_NODE_MAP for callee lookup.
+                                    traverse_node(member, current_package, full_class_name)
                         else:
                             traverse_node(child, current_package, full_class_name)
                 return
@@ -567,7 +599,7 @@ def extract_cpp_function_definitions(tree, file_path: str, language: str,
     def get_node_text(node) -> str:
         try:
             if node.start_byte is not None and node.end_byte is not None:
-                return source_code[node.start_byte:node.end_byte]
+                return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='ignore')
         except:
             pass
         return ""
@@ -653,7 +685,7 @@ def extract_javascript_function_definitions(tree, file_path: str, language: str,
     def get_node_text(node) -> str:
         try:
             if node.start_byte is not None and node.end_byte is not None:
-                return source_code[node.start_byte:node.end_byte]
+                return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='ignore')
         except:
             pass
         return ""
@@ -729,7 +761,7 @@ def process_java_file_enhanced_fixed(tree, file_path: str, source_lines: List[by
     """Process Java file (fixed version)"""
     from tree_sitter import Node
 
-    # Re-read source code for consistency
+    # Read source code (file opened once per process_*_file_* call)
     with open(file_path, 'rb') as f:
         source_bytes = f.read()
     source_code = source_bytes.decode('utf-8', errors='ignore')
@@ -739,7 +771,7 @@ def process_java_file_enhanced_fixed(tree, file_path: str, source_lines: List[by
         try:
             if hasattr(node, 'start_byte') and hasattr(node, 'end_byte'):
                 if node.start_byte is not None and node.end_byte is not None:
-                    return source_code[node.start_byte:node.end_byte]
+                    return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='ignore')
         except:
             pass
         return ""
@@ -763,12 +795,20 @@ def process_java_file_enhanced_fixed(tree, file_path: str, source_lines: List[by
                 package_name = get_node_text(name_node)
             break
 
-    # Extract import statements
+    # Extract import statements. Store the bare qualified name (e.g. "java.util.List")
+    # so callee lookup can match a trailing ".List" by suffix.
     imports = []
     for child in tree.root_node.children:
         if child.type == "import_declaration":
-            import_text = get_node_text(child)
-            imports.append(import_text)
+            name_node = child.child_by_field_name("name")
+            if name_node:
+                qualified = get_node_text(name_node).strip()
+                if qualified:
+                    imports.append(qualified)
+
+    # Stash this file's imports under its absolute path so the call-graph build
+# step can look them up by caller file_path.
+    FILE_IMPORTS_MAP[file_path] = imports
 
     # Cache for collected class and method calls
     processed_methods = set()
@@ -988,6 +1028,11 @@ def process_java_file_enhanced_fixed(tree, file_path: str, source_lines: List[by
                             if member.type == "method_declaration":
                                 process_method(member, qualified_name, new_class_node_id,
                                                file_path, source_lines, tree, imports, enable_dataflow)
+                            elif member.type in ("class_declaration", "interface_declaration",
+                                                  "enum_declaration"):
+                                # Nested class/interface/enum: recurse so its own
+                                # members get processed under a qualified name.
+                                traverse_and_process(member, qualified_name, new_class_node_id)
                     else:
                         traverse_and_process(child, qualified_name, new_class_node_id)
 
@@ -1011,7 +1056,7 @@ def process_cpp_file_enhanced(tree, file_path: str, source_lines: List[bytes],
     """Process C++ file (enhanced version), supports cross-function data flow analysis"""
     from tree_sitter import Node
 
-    # Re-read source code
+    # Read source code (file opened once per process_*_file_* call)
     with open(file_path, 'rb') as f:
         source_bytes = f.read()
     source_code = source_bytes.decode('utf-8', errors='ignore')
@@ -1021,7 +1066,7 @@ def process_cpp_file_enhanced(tree, file_path: str, source_lines: List[bytes],
         try:
             if hasattr(node, 'start_byte') and hasattr(node, 'end_byte'):
                 if node.start_byte is not None and node.end_byte is not None:
-                    return source_code[node.start_byte:node.end_byte]
+                    return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='ignore')
         except:
             pass
         return ""
@@ -1338,11 +1383,47 @@ def process_cpp_file_enhanced(tree, file_path: str, source_lines: List[bytes],
                     if member.type == "function_definition":
                         process_function_definition(member, class_name, namespace, True)
                     elif member.type == "declaration":
-                        # Process declared but not defined member functions
+                        # Process declared (but not defined) member functions: register as method nodes
                         for submember in member.children:
                             if submember.type in ["function_declarator", "declarator"]:
-                                # Can handle declared member functions here
-                                pass
+                                decl_text = get_node_text(submember)
+                                # Extract function name (last identifier before '(' or '<')
+                                decl_name = ""
+                                for ident in reversed(submember.children):
+                                    if ident.type == "identifier" or ident.type == "field_identifier":
+                                        decl_name = get_node_text(ident)
+                                        break
+                                if not decl_name:
+                                    continue
+                                # C++ method id format is "Method:<class>::<method>" — matching
+                                # process_function_definition's full_func_name so definitions and
+                                # declarations of the same method collapse to a single node.
+                                decl_node_id = f"Method:{full_class_name}::{decl_name}"
+                                if any(n.id == decl_node_id for n in all_nodes):
+                                    continue
+                                decl_node = GraphNode(
+                                    id=decl_node_id,
+                                    type=NodeType.METHOD,
+                                    name=decl_name,
+                                    language='cpp',
+                                    signature=decl_text.split('\n')[0][:120] + ";",
+                                    file_path=file_path,
+                                    start_line=member.start_point[0] + 1,
+                                    end_line=member.end_point[0] + 1,
+                                    raw_attributes={"declared_only": True}
+                                )
+                                all_nodes.append(decl_node)
+                                # find_cpp_callee_node_id looks up "<class>::<method>" (no
+                                # "Method:" prefix), so the FUNCTION_NODE_MAP key has to match
+                                # that bare form for caller-side lookup to resolve.
+                                FUNCTION_NODE_MAP[f"{full_class_name}::{decl_name}"] = decl_node_id
+                                # Class contains declared method
+                                all_edges.append(GraphEdge(
+                                    source_id=class_node_id,
+                                    target_id=decl_node_id,
+                                    type=EdgeType.CONTAINS,
+                                    language='cpp'
+                                ))
 
     def process_namespace(namespace_node: Node, parent_namespace: str = ""):
         """Process namespace"""
@@ -1453,7 +1534,7 @@ def process_javascript_file_enhanced(tree, file_path: str, source_lines: List[by
         try:
             if hasattr(node, 'start_byte') and hasattr(node, 'end_byte'):
                 if node.start_byte is not None and node.end_byte is not None:
-                    return source_code[node.start_byte:node.end_byte]
+                    return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='ignore')
         except:
             pass
         return ""
@@ -1479,8 +1560,18 @@ def process_javascript_file_enhanced(tree, file_path: str, source_lines: List[by
             if name_node:
                 func_name = get_node_text(name_node)
         elif func_type == "arrow_function":
-            # Arrow functions may not have names
-            func_name = "arrow_function"
+            # Arrow functions get their identity from the surrounding
+            # `const foo = () => ...` declarator when present; otherwise we
+            # fall back to a positional label so each arrow still has a
+            # unique node_id.
+            func_name = "anonymous_arrow"
+            parent = func_node.parent
+            if parent is not None and parent.type == "variable_declarator":
+                name_field = parent.child_by_field_name("name")
+                if name_field is not None:
+                    extracted = get_node_text(name_field).strip()
+                    if extracted:
+                        func_name = extracted
         elif func_type == "method_definition":
             name_node = func_node.child_by_field_name("name")
             if name_node:
@@ -1646,18 +1737,58 @@ def process_javascript_file_enhanced(tree, file_path: str, source_lines: List[by
                     if child.type == "class_body":
                         for member in child.children:
                             traverse_and_process(member, class_name, current_module)
+                # Skip the tail-recursion over class_body members: they were
+                # already processed above with class_name set, and a second
+                # pass would register them again as Function nodes.
+                return
 
         # ES6 module export/import
         elif node_type in ["export_statement", "import_statement"]:
-            # Can handle module dependencies here
-            pass
+            # Record module-level export/import statements as IMPORT edges between file
+# nodes and the imported Module node.
+            stmt_text = get_node_text(node)
+            if node_type == "import_statement":
+                # e.g. import foo from './bar' or import { x } from './bar'
+                m = re.search(r"from\s*['\"]([^'\"]+)['\"]", stmt_text)
+                if m:
+                    module_name = m.group(1)
+                    module_node_id = f"Module:{module_name}"
+                    all_edges.append(GraphEdge(
+                        source_id=file_node_id,
+                        target_id=module_node_id,
+                        type=EdgeType.IMPORT,
+                        language='javascript',
+                        properties={'import_path': module_name, 'statement': stmt_text[:200]}
+                    ))
+            elif node_type == "export_statement":
+                # e.g. export default foo / export { foo, bar }
+                m = re.search(r"export\s+(?:default\s+)?(?:\{([^}]+)\}|(\w+))", stmt_text)
+                exported_names = []
+                if m:
+                    if m.group(1):
+                        exported_names = [n.strip().split(' as ')[0] for n in m.group(1).split(',') if n.strip()]
+                    elif m.group(2):
+                        exported_names = [m.group(2).strip()]
+                for ex_name in exported_names:
+                    if not ex_name:
+                        continue
+                    export_node_id = f"Export:{file_path}::{ex_name}"
+                    all_edges.append(GraphEdge(
+                        source_id=file_node_id,
+                        target_id=export_node_id,
+                        type=EdgeType.EXPORTS,
+                        language='javascript',
+                        properties={'export_name': ex_name, 'statement': stmt_text[:200]}
+                    ))
 
         # Recursively process child nodes
         for child in node.children:
             traverse_and_process(child, current_class, current_module)
 
-    # Main processing logic
-    traverse_and_process(tree.root_node)
+    # Main processing logic. Module name is derived from the bare filename so
+    # that functions from different files occupy distinct namespaces.
+    module_name = Path(file_path).stem
+    traverse_and_process(tree.root_node, current_module=module_name)
 
     return True
 
@@ -1698,7 +1829,7 @@ def process_single_file_enhanced(file_path: str, all_nodes: List[GraphNode],
         elif language == 'cpp':
             extract_cpp_function_definitions(tree, file_path, language, all_nodes, source_bytes)
         elif language == 'javascript':
-            # Added: Extract JavaScript function definitions
+            # JavaScript function definitions extraction
             extract_javascript_function_definitions(tree, file_path, language, all_nodes, source_bytes)
 
         # Language-specific detailed processing
@@ -1711,7 +1842,7 @@ def process_single_file_enhanced(file_path: str, all_nodes: List[GraphNode],
                                       all_nodes, all_edges, function_raw_info_map,
                                       enable_dataflow)
         elif language == 'javascript':
-            # Added: Process JavaScript files
+            # JavaScript file processing
             process_javascript_file_enhanced(tree, file_path, source_lines, file_node_id,
                                              all_nodes, all_edges, function_raw_info_map,
                                              enable_dataflow)
@@ -2083,45 +2214,76 @@ def process_directory_enhanced(source_dir: str, output_dir: str = "./output",
     
     # 2. Build call relationships
     logger.info("Building call graphs...")
-    
-    # 2.1 Collect Java call relationships
-    java_call_edges = 0
+
+    # 2.1 Collect call relationships (Java / C++ / JavaScript).
+    # Resolve the caller's language from the GraphNode itself (not just id prefix,
+    # because both Java method and C++/JS method share the "Method:" id format).
+    call_edges_added = 0
+    node_by_id = {n.id: n for n in all_nodes}
     for caller_name, callee_names in FUNCTION_CALL_GRAPH.items():
         caller_node_id = FUNCTION_NODE_MAP.get(caller_name)
         if not caller_node_id:
             continue
-            
+        caller_node = node_by_id.get(caller_node_id)
+        caller_lang = caller_node.language if caller_node else "java"
+
         for callee_name in callee_names:
-            # Try to find callee
             callee_node_id = None
-            
-            if "java" in caller_node_id.lower():
-                # Java: try to find in current class or imported classes
-                pass
-            elif "cpp" in caller_node_id.lower():
-                # C++: handle namespace and class
-                pass
-            elif "javascript" in caller_node_id.lower():
-                # JavaScript: handle module and class
-                pass
-                
+
+            if caller_lang == "java":
+                parts = caller_name.rsplit('.', 1)
+                caller_class = parts[0] if len(parts) == 2 else ""
+                caller_imports = FILE_IMPORTS_MAP.get(caller_node.file_path or "", [])
+                callee_node_id = find_java_callee_node_id(
+                    callee_name, caller_class, caller_imports, caller_node.file_path or ""
+                )
+
+            elif caller_lang == "cpp":
+                # caller_name for C++ is qualified with '::'; last segment is the
+                # function name, everything before is namespace + class chain.
+                if "::" in caller_name:
+                    head, _ = caller_name.rsplit("::", 1)
+                    # last ::-segment before function is the class (if any), remainder is namespace
+                    if "::" in head:
+                        caller_namespace, caller_class = head.rsplit("::", 1)
+                    else:
+                        caller_namespace, caller_class = "", head
+                else:
+                    caller_namespace, caller_class = "", ""
+                callee_node_id = find_cpp_callee_node_id(
+                    callee_name, caller_namespace, caller_class, [], ""
+                )
+
+            elif caller_lang == "javascript":
+                # caller_name uses '.' as separator (module.class.method or class.method).
+                if "." in caller_name:
+                    parts = caller_name.rsplit(".", 1)
+                    head = parts[0]
+                    caller_class = head.rsplit(".", 1)[-1] if "." in head else head
+                    current_module = head.rsplit(".", 1)[0] if "." in head else ""
+                else:
+                    current_module, caller_class = "", ""
+                callee_node_id = find_javascript_callee_node_id(
+                    callee_name, current_module, caller_class, ""
+                )
+
             if callee_node_id:
-                # Check if edge already exists
-                edge_exists = any(e for e in all_edges 
-                                  if e.source_id == caller_node_id and 
-                                  e.target_id == callee_node_id and 
-                                  e.type == EdgeType.CALLS)
-                
+                edge_exists = any(
+                    e for e in all_edges
+                    if e.source_id == caller_node_id
+                    and e.target_id == callee_node_id
+                    and e.type == EdgeType.CALLS
+                )
                 if not edge_exists:
                     all_edges.append(GraphEdge(
                         source_id=caller_node_id,
                         target_id=callee_node_id,
                         type=EdgeType.CALLS,
-                        language='java',
+                        language=caller_lang,
                         properties={'caller': caller_name, 'callee': callee_name}
                     ))
-                    java_call_edges += 1
-    
+                    call_edges_added += 1
+
     # 3. Data flow analysis
     if enable_dataflow:
         logger.info("Performing cross-function data flow analysis...")
@@ -2184,14 +2346,16 @@ def process_directory_enhanced(source_dir: str, output_dir: str = "./output",
 
 # === Enhanced LLM interaction functions ===
 def summarize_function_with_llm_enhanced(function_node: GraphNode, raw_info: Dict) -> str:
-    """Generate function summary using LLM (enhanced version)"""
+    """Generate function summary using LLM (enhanced version). API_URL/API_KEY are placeholders; the call
+    is only attempted when both are configured. Otherwise a deterministic fallback summary is returned
+    so the knowledge base still gets populated for downstream retrieval."""
     try:
         code_snippet = raw_info.get('code_snippet', '')
         comment = raw_info.get('comment', '')
-        
+
         if not code_snippet or code_snippet.strip() == '':
             return "No code available for summarization"
-        
+
         prompt = f"""
 Please analyze the following {function_node.language} function and provide a concise summary:
 
@@ -2216,12 +2380,106 @@ Parameters: [list parameters with descriptions]
 Returns: [describe return value]
 Notes: [any additional notes]
 """
-        
-        return f"Function: {function_node.name} - Generated summary available"
-        
+
+        # API not configured -> deterministic fallback so the knowledge base is still usable
+        if not API_URL or not API_KEY:
+            sig = (function_node.signature or '').strip()
+            preview = code_snippet.strip().splitlines()[0][:120] if code_snippet.strip() else ''
+            return (
+                f"Summary: Function {function_node.name} in {function_node.language}.\n"
+                f"Logic: {preview}\n"
+                f"Parameters: derived from signature '{sig}'\n"
+                f"Returns: derived from signature\n"
+                f"Notes: API not configured; fallback summary."
+            )
+
+        headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 500,
+        }
+        resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return content or f"Function: {function_node.name} - Empty LLM response"
+
     except Exception as e:
-        logger.error(f"LLM summarization error: {e}")
-        return f"Summary generation failed: {str(e)}"
+        logger.error(f"LLM summarization error for {function_node.name}: {e}")
+        return f"Summary generation failed for {function_node.name}: {str(e)}"
+
+
+# === Embedding / FAISS output ===
+def embed_function_summary(text: str) -> np.ndarray:
+    """Embed a function summary (or signature) into a 1024-dim vector.
+
+    When DASHSCOPE_API_KEY is set, calls DashScope text-embedding-v4; otherwise
+    returns a deterministic zero vector so the FAISS index is still produced.
+    Empty input also yields a zero vector — FAISS rejects NaN/empty rows.
+    """
+    if not text or not text.strip():
+        return np.zeros(EMBEDDING_DIM, dtype='float32')
+    if DASHSCOPE_API_KEY:
+        try:
+            import dashscope
+            dashscope.api_key = DASHSCOPE_API_KEY
+            from dashscope import TextEmbedding
+            resp = TextEmbedding.call(
+                model="text-embedding-v4",
+                input=text[:2000],
+                parameters={"text_type": "document"},
+            )
+            if resp.status_code == 200:
+                emb = np.array(resp.output['embeddings'][0]['embedding'], dtype='float32')
+                if emb.shape[0] == EMBEDDING_DIM:
+                    return emb
+                logger.warning(
+                    f"Embedding dim mismatch (got {emb.shape[0]}, expected {EMBEDDING_DIM}); "
+                    f"falling back to zero vector"
+                )
+        except Exception as e:
+            logger.warning(f"DashScope embedding failed: {e}; using zero vector")
+    return np.zeros(EMBEDDING_DIM, dtype='float32')
+
+
+def build_and_save_faiss_index(metadatas: Dict, faiss_path: str) -> None:
+    """Build a FAISS IndexFlatIP over EMBEDDING_DIM and write it to disk.
+
+    metadatas is the {"vectors": [...]} dict already prepared for the JSON
+    sidecar; each entry gets an `embedding` field populated before the FAISS
+    matrix is extracted. The JSON payload on disk also carries the embeddings
+    so the RC fallback `_build_faiss_from_metadata` can rebuild without
+    re-querying the embedding API.
+    """
+    entries = metadatas.get("vectors", [])
+    if not entries:
+        logger.info("No metadata entries; skipping FAISS index output.")
+        return
+
+    logger.info(f"Building FAISS index over {len(entries)} entries (dim={EMBEDDING_DIM})...")
+    matrix = np.zeros((len(entries), EMBEDDING_DIM), dtype='float32')
+    for i, entry in enumerate(entries):
+        text = (
+            entry.get("summary") or entry.get("signature")
+            or entry.get("name") or ""
+        )
+        vec = embed_function_summary(text)
+        matrix[i] = vec
+        # Persist the embedding so consumers (and RC's rebuild fallback)
+        # can use it directly without an extra API call.
+        entry["embedding"] = vec.tolist()
+
+    # IndexFlatIP needs non-zero norm vectors for cosine-like scoring to be
+    # meaningful. When the entire matrix is zero (no API configured) the
+    # index is still valid — search returns distance 0 for all candidates,
+    # which is what downstream code already handles by gating on
+    # SIMILARITY_THRESHOLD.
+    index = faiss.IndexFlatIP(EMBEDDING_DIM)
+    index.add(matrix)
+    faiss.write_index(index, faiss_path)
+    logger.info(f"FAISS index written: {faiss_path} (ntotal={index.ntotal}, dim={index.d})")
 
 
 def enhance_all_functions_with_llm(all_nodes: List[GraphNode], function_raw_info_map: Dict) -> List[GraphNode]:
@@ -2274,7 +2532,41 @@ if __name__ == "__main__":
         logger.info("Generating function summaries...")
         enhanced_nodes = enhance_all_functions_with_llm(result['nodes'], result['function_info'])
         logger.info(f"Generated summaries for {len(enhanced_nodes)} functions")
-        
+
+        # Write metadatas.json in a schema compatible with RCTraceability's loader.
+        # RCTraceability reads: {"vectors": [{node_id, id, name, function_name, summary, ...}, ...]}
+        # We only emit function/method nodes (those are what gets embedded/retrieved).
+        logger.info("Writing metadatas.json for downstream traceability...")
+        metadatas = {
+            "vectors": [
+                {
+                    "node_id": n.id,
+                    "id": n.id,
+                    "name": n.name,
+                    "function_name": n.name,
+                    "file_path": n.file_path,
+                    "signature": n.signature or "",
+                    "summary": getattr(n, "summary", "") or "",
+                    "language": n.language,
+                    "type": n.type.value if hasattr(n.type, "value") else str(n.type),
+                    "start_line": n.start_line,
+                    "end_line": n.end_line,
+                }
+                for n in result['nodes']
+                if n.type in (NodeType.FUNCTION, NodeType.METHOD)
+            ]
+        }
+
+        # Embedding pass: populate `embedding` on every entry and emit a FAISS
+        # index alongside metadatas.json.
+        faiss_path = os.path.join(output_dir, "vectors.faiss")
+        build_and_save_faiss_index(metadatas, faiss_path)
+
+        metadatas_file = os.path.join(output_dir, "metadatas.json")
+        with open(metadatas_file, "w", encoding="utf-8") as f:
+            json.dump(metadatas, f, ensure_ascii=False, indent=2)
+        logger.info(f"Metadatas written: {metadatas_file} ({len(metadatas['vectors'])} entries)")
+
         logger.info("=" * 60)
         logger.info("Processing completed successfully!")
         
